@@ -1,0 +1,237 @@
+name: PostgreSQL OCI Deployment
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  DOCKER_HUB_USERNAME: ${{ secrets.DOCKER_HUB_USERNAME }}
+  DOCKER_HUB_TOKEN: ${{ secrets.DOCKER_HUB_TOKEN }}
+  OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+  OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+  OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+  OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+  OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
+  OCI_COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
+  BASTION_HOST_IP: ${{ secrets.BASTION_HOST_IP }}
+  BASTION_SSH_PRIVATE_KEY: ${{ secrets.BASTION_SSH_PRIVATE_KEY }}
+  BASTION_USER: ${{ secrets.BASTION_USER }}
+  KUBECONFIG_DATA: ${{ secrets.KUBECONFIG_DATA }}
+  POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+  POSTGRES_USER: postgres
+  POSTGRES_DB: postgres
+  IMAGE_NAME: optimized-postgres
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  build_and_push:
+    name: Build, Optimize and Push Docker Image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ env.DOCKER_HUB_USERNAME }}
+          password: ${{ env.DOCKER_HUB_TOKEN }}
+
+      - name: Create PostgreSQL Dockerfile
+        run: |
+          cat > Dockerfile << 'EOF'
+          # Use official PostgreSQL as base
+          FROM postgres:15-alpine
+
+          # Set environment variables
+          ENV POSTGRES_PASSWORD=$POSTGRES_PASSWORD
+          ENV POSTGRES_USER=$POSTGRES_USER
+          ENV POSTGRES_DB=$POSTGRES_DB
+
+          # Add any custom configurations
+          COPY postgresql.conf /etc/postgresql/postgresql.conf
+
+          # Add initialization scripts
+          COPY init-scripts/ /docker-entrypoint-initdb.d/
+
+          # Expose the PostgreSQL port
+          EXPOSE 5432
+
+          # Use custom configuration
+          CMD ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
+          EOF
+
+          # Create directory for init scripts
+          mkdir -p init-scripts
+          
+          # Create a sample initialization script
+          cat > init-scripts/init-db.sh << 'EOF'
+          #!/bin/bash
+          set -e
+
+          psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-EOSQL
+              CREATE TABLE IF NOT EXISTS example_table (
+                  id SERIAL PRIMARY KEY,
+                  name VARCHAR(100),
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+              );
+              
+              INSERT INTO example_table (name) VALUES ('Example Data');
+          EOSQL
+          EOF
+
+          # Create custom PostgreSQL configuration
+          cat > postgresql.conf << 'EOF'
+          listen_addresses = '*'
+          max_connections = 100
+          shared_buffers = 128MB
+          dynamic_shared_memory_type = posix
+          log_timezone = 'UTC'
+          datestyle = 'iso, mdy'
+          timezone = 'UTC'
+          lc_messages = 'en_US.utf8'
+          lc_monetary = 'en_US.utf8'
+          lc_numeric = 'en_US.utf8'
+          lc_time = 'en_US.utf8'
+          default_text_search_config = 'pg_catalog.english'
+          EOF
+
+          chmod +x init-scripts/init-db.sh
+
+      - name: Build and optimize Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: true
+          tags: ${{ env.DOCKER_HUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          cache-from: type=registry,ref=${{ env.DOCKER_HUB_USERNAME }}/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.DOCKER_HUB_USERNAME }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+          platforms: linux/amd64
+          build-args: |
+            POSTGRES_USER=${{ env.POSTGRES_USER }}
+            POSTGRES_PASSWORD=${{ env.POSTGRES_PASSWORD }}
+            POSTGRES_DB=${{ env.POSTGRES_DB }}
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.DOCKER_HUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
+          severity: 'CRITICAL,HIGH'
+
+      - name: Push image to DockerHub
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.DOCKER_HUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+            ${{ env.DOCKER_HUB_USERNAME }}/${{ env.IMAGE_NAME }}:latest
+          platforms: linux/amd64
+          cache-from: type=registry,ref=${{ env.DOCKER_HUB_USERNAME }}/${{ env.IMAGE_NAME }}:buildcache
+
+  deploy_to_bastion:
+    name: Deploy PostgreSQL to Bastion Host
+    needs: build_and_push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install SSH key
+        uses: shimataro/ssh-key-action@v2
+        with:
+          key: ${{ env.BASTION_SSH_PRIVATE_KEY }}
+          known_hosts: 'just-a-placeholder-so-we-dont-get-errors'
+          if_key_exists: replace
+
+      - name: Add Bastion Host to known hosts
+        run: ssh-keyscan -H ${{ env.BASTION_HOST_IP }} >> ~/.ssh/known_hosts
+
+      - name: Deploy PostgreSQL to Bastion
+        run: |
+          ssh ${{ env.BASTION_USER }}@${{ env.BASTION_HOST_IP }} << 'EOF'
+            # Install Docker if not already installed
+            if ! command -v docker &> /dev/null; then
+              echo "Installing Docker..."
+              sudo apt-get update
+              sudo apt-get install -y apt-transport-https ca-certificates curl gnupg lsb-release
+              curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+              echo "deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+              sudo apt-get update
+              sudo apt-get install -y docker-ce docker-ce-cli containerd.io
+              sudo systemctl enable docker
+              sudo systemctl start docker
+              sudo usermod -aG docker $USER
+            fi
+
+            # Login to Docker Hub
+            echo "${{ env.DOCKER_HUB_TOKEN }}" | docker login -u ${{ env.DOCKER_HUB_USERNAME }} --password-stdin
+
+            # Pull the image
+            docker pull ${{ env.DOCKER_HUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+
+            # Stop and remove existing container if it exists
+            docker rm -f postgres-container || true
+
+            # Create data volume if it doesn't exist
+            docker volume create postgres-data || true
+
+            # Run the container
+            docker run -d \
+              --name postgres-container \
+              -p 5432:5432 \
+              -e POSTGRES_PASSWORD=${{ env.POSTGRES_PASSWORD }} \
+              -e POSTGRES_USER=${{ env.POSTGRES_USER }} \
+              -e POSTGRES_DB=${{ env.POSTGRES_DB }} \
+              -v postgres-data:/var/lib/postgresql/data \
+              --restart unless-stopped \
+              ${{ env.DOCKER_HUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+
+            # Verify the container is running
+            docker ps | grep postgres-container
+          EOF
+
+  deploy_to_oke:
+    name: Deploy PostgreSQL to OKE
+    needs: build_and_push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v3
+      
+      - name: Set up OCI CLI
+        run: |
+          # Install OCI CLI
+          pip install oci-cli
+          
+          # Create OCI CLI config directory
+          mkdir -p ~/.oci
+          
+          # Create config file
+          cat > ~/.oci/config << EOF
+          [DEFAULT]
+          user=${{ env.OCI_CLI_USER }}
+          tenancy=${{ env.OCI_CLI_TENANCY }}
+          fingerprint=${{ env.OCI_CLI_FINGERPRINT }}
+          region=${{ env.OCI_CLI_REGION }}
+          key_file=~/.oci/oci_api_key.pem
+          EOF
+          
+          # Create private key file
+          echo "${{ env.OCI_CLI_KEY_CONTENT }}" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+
+      - name: Create K8s manifests
+        run: |
+          # Setup kubeconfig
+          mkdir -p $HOME/.kube
+          echo "${{ env.KUBECONFIG_DATA }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
