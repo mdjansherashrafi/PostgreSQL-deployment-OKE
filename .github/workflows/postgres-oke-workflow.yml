@@ -153,7 +153,18 @@ jobs:
           if_key_exists: replace
 
       - name: Add Bastion Host to known hosts
-        run: ssh-keyscan -H ${{ env.BASTION_HOST_IP }} >> ~/.ssh/known_hosts
+        run: |
+         echo "Attempting to scan SSH keys from host: ${{ env.BASTION_HOST_IP }}"
+         if ! ssh-keyscan -v -H ${{ env.BASTION_HOST_IP }} >> ~/.ssh/known_hosts 2> keyscan_error.log; then
+         echo "SSH keyscan failed. Error log:"
+         cat keyscan_error.log
+         echo "Checking if host is reachable..."
+         timeout 5 ping -c 3 ${{ env.BASTION_HOST_IP }} || echo "Host appears to be unreachable via ping"
+         echo "Checking if port 22 is open..."
+         timeout 5 nc -zv ${{ env.BASTION_HOST_IP }} 22 || echo "Port 22 appears to be closed or filtered"
+         exit 1
+         fi
+         echo "SSH keyscan completed successfully"
 
       - name: Deploy PostgreSQL to Bastion
         run: |
