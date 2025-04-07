@@ -152,16 +152,24 @@ jobs:
           known_hosts: 'just-a-placeholder-so-we-dont-get-errors'
           if_key_exists: replace
 
-      - name: Create OCI Bastion Session
-        run: |
-          # Create a bastion session
-          oci bastion session create-port-forwarding \
-          --bastion-id ${{ secrets.BASTION_OCID }} \
-          --target-resource-id ${{ secrets.TARGET_INSTANCE_OCID }} \
-          --target-port 22 \
-          --session-ttl 3600 \
-          --wait-for-state SUCCEEDED \
-          --display-name "GHActions-Session"
+     - name: Create OCI Bastion Session
+  run: |
+    # Create bastion session
+    SESSION=$(oci bastion session create-port-forwarding \
+      --bastion-id ${{ secrets.BASTION_OCID }} \
+      --target-resource-id ${{ secrets.TARGET_INSTANCE_OCID }} \
+      --target-port 22 \
+      --session-ttl 3600 \
+      --wait-for-state SUCCEEDED \
+      --display-name "GHActions-Session" \
+      --query "data.\"session-id\"" \
+      --raw-output)
+    
+    # Store session ID for later use
+    echo "SESSION_ID=$SESSION" >> $GITHUB_ENV
+    
+    # Get session connection details
+    oci bastion session get --session-id $SESSION
 
       - name: Deploy PostgreSQL to Bastion
         run: |
@@ -217,25 +225,33 @@ jobs:
       
       - name: Set up OCI CLI
         run: |
-          # Install OCI CLI
-          pip install oci-cli
-          
-          # Create OCI CLI config directory
+         # Install OCI CLI with dependencies
+         sudo apt-get update
+         sudo apt-get install -y python3-pip
+         pip install oci-cli
+    
+         # Verify installation
+          oci --version
+    
+         # Create OCI config directory
           mkdir -p ~/.oci
-          
-          # Create config file
-          cat > ~/.oci/config << EOF
+    
+         # Create config file
+         cat > ~/.oci/config << EOF
           [DEFAULT]
-          user=${{ env.OCI_CLI_USER }}
-          tenancy=${{ env.OCI_CLI_TENANCY }}
-          fingerprint=${{ env.OCI_CLI_FINGERPRINT }}
-          region=${{ env.OCI_CLI_REGION }}
-          key_file=~/.oci/oci_api_key.pem
-          EOF
-          
-          # Create private key file
-          echo "${{ env.OCI_CLI_KEY_CONTENT }}" > ~/.oci/oci_api_key.pem
-          chmod 600 ~/.oci/oci_api_key.pem
+           user=${{ env.OCI_CLI_USER }}
+           tenancy=${{ env.OCI_CLI_TENANCY }}
+           fingerprint=${{ env.OCI_CLI_FINGERPRINT }}
+            region=${{ env.OCI_CLI_REGION }}
+             key_file=~/.oci/oci_api_key.pem
+             EOF
+    
+         # Create private key file
+         echo "${{ env.OCI_CLI_KEY_CONTENT }}" > ~/.oci/oci_api_key.pem
+         chmod 600 ~/.oci/oci_api_key.pem
+    
+          # Verify configuration
+           oci iam region list --config-file ~/.oci/config
 
       - name: Create K8s manifests
         run: |
