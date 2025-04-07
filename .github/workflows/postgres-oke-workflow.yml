@@ -215,6 +215,7 @@ jobs:
             docker ps | grep postgres-container
           EOF
 
+  jobs:
   deploy_to_oke:
     name: Deploy PostgreSQL to OKE
     needs: build_and_push
@@ -222,36 +223,97 @@ jobs:
     steps:
       - name: Check out the repo
         uses: actions/checkout@v3
-      
-      - name: Set up OCI CLI
+
+      # Step 1: Install Python and required dependencies
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'  # OCI CLI requires Python 3.6+
+          cache: 'pip'
+
+      # Step 2: Install OCI CLI with explicit PATH handling
+      - name: Install OCI CLI
         run: |
-         # Install OCI CLI with dependencies
-         sudo apt-get update
-         sudo apt-get install -y python3-pip
-         pip install oci-cli
-    
-         # Verify installation
+          python -m pip install --upgrade pip
+          pip install oci-cli
+          
+          # Verify installation and show version
+          echo "OCI CLI installation path:"
+          python -c "import oci; print(oci.__file__)"
+          
+          echo "Adding OCI CLI to PATH"
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          echo "PATH=$PATH:$HOME/.local/bin" >> $GITHUB_ENV
+          
+          # Verify oci command is available
+          which oci || echo "OCI CLI not found in PATH"
           oci --version
-    
-         # Create OCI config directory
+
+      # Step 3: Configure OCI CLI
+      - name: Configure OCI CLI
+        run: |
           mkdir -p ~/.oci
-    
-         # Create config file
-         cat > ~/.oci/config << EOF
+          
+          # Create config file
+          cat > ~/.oci/config << EOF
           [DEFAULT]
-           user=${{ env.OCI_CLI_USER }}
-           tenancy=${{ env.OCI_CLI_TENANCY }}
-           fingerprint=${{ env.OCI_CLI_FINGERPRINT }}
-            region=${{ env.OCI_CLI_REGION }}
-             key_file=~/.oci/oci_api_key.pem
-             EOF
-    
-         # Create private key file
-         echo "${{ env.OCI_CLI_KEY_CONTENT }}" > ~/.oci/oci_api_key.pem
-         chmod 600 ~/.oci/oci_api_key.pem
-    
+          user=${{ env.OCI_CLI_USER }}
+          tenancy=${{ env.OCI_CLI_TENANCY }}
+          fingerprint=${{ env.OCI_CLI_FINGERPRINT }}
+          region=${{ env.OCI_CLI_REGION }}
+          key_file=~/.oci/oci_api_key.pem
+          EOF
+          
+          # Create private key file
+          echo "${{ env.OCI_CLI_KEY_CONTENT }}" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+          
           # Verify configuration
-           oci iam region list --config-file ~/.oci/config
+          echo "Testing OCI configuration..."
+          oci os ns get
+
+      # Step 4: Create Bastion Session with robust error handling
+      - name: Create Bastion Session
+        run: |
+          echo "Current PATH: $PATH"
+          which oci || { echo "OCI CLI not found!"; exit 1; }
+          
+          # Create session with retries
+          max_retries=3
+          retry_count=0
+          
+          while [ $retry_count -lt $max_retries ]; do
+            echo "Attempt $((retry_count+1)) to create bastion session"
+            
+            SESSION_OUTPUT=$(oci bastion session create-port-forwarding \
+              --bastion-id ${{ secrets.BASTION_OCID }} \
+              --target-resource-id ${{ secrets.TARGET_INSTANCE_OCID }} \
+              --target-port 22 \
+              --session-ttl 3600 \
+              --wait-for-state SUCCEEDED \
+              --display-name "GHA-Session-$GITHUB_RUN_ID" \
+              --query "data.\"session-id\"" \
+              --raw-output 2>&1)
+            
+            if [ $? -eq 0 ]; then
+              echo "SESSION_ID=$SESSION_OUTPUT" >> $GITHUB_ENV
+              echo "Successfully created session: $SESSION_OUTPUT"
+              break
+            else
+              echo "Session creation failed: $SESSION_OUTPUT"
+              retry_count=$((retry_count+1))
+              sleep 10
+            fi
+          done
+          
+          if [ $retry_count -eq $max_retries ]; then
+            echo "Failed to create session after $max_retries attempts"
+            exit 1
+          fi
+
+          # Get session details
+          echo "Session details:"
+          oci bastion session get --session-id $SESSION_ID
 
       - name: Create K8s manifests
         run: |
