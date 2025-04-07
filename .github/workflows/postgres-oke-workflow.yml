@@ -152,24 +152,24 @@ jobs:
           known_hosts: 'just-a-placeholder-so-we-dont-get-errors'
           if_key_exists: replace
 
-     - name: Create OCI Bastion Session
-  run: |
-    # Create bastion session
-    SESSION=$(oci bastion session create-port-forwarding \
-      --bastion-id ${{ secrets.BASTION_OCID }} \
-      --target-resource-id ${{ secrets.TARGET_INSTANCE_OCID }} \
-      --target-port 22 \
-      --session-ttl 3600 \
-      --wait-for-state SUCCEEDED \
-      --display-name "GHActions-Session" \
-      --query "data.\"session-id\"" \
-      --raw-output)
+      - name: Create OCI Bastion Session
+        run: |
+         # Create bastion session
+         SESSION=$(oci bastion session create-port-forwarding \
+         --bastion-id ${{ secrets.BASTION_OCID }} \
+         --target-resource-id ${{ secrets.TARGET_INSTANCE_OCID }} \
+         --target-port 22 \
+         --session-ttl 3600 \
+         --wait-for-state SUCCEEDED \
+         --display-name "GHActions-Session" \
+         --query "data.\"session-id\"" \
+         --raw-output)
     
-    # Store session ID for later use
-    echo "SESSION_ID=$SESSION" >> $GITHUB_ENV
+         # Store session ID for later use
+          echo "SESSION_ID=$SESSION" >> $GITHUB_ENV
     
-    # Get session connection details
-    oci bastion session get --session-id $SESSION
+         # Get session connection details
+          oci bastion session get --session-id $SESSION
 
       - name: Deploy PostgreSQL to Bastion
         run: |
